@@ -1,0 +1,27 @@
+{
+  "name": "matnoble-tts-skill",
+  "version": "1.0.0",
+  "description": "AI Agent Skill for MatNoble-TTS: High-quality Text-to-Speech, Directives Injection & SSML Generation",
+  "keywords": [
+    "agent-skill",
+    "tts",
+    "text-to-speech",
+    "ssml",
+    "voice",
+    "speech-synthesis",
+    "antigravity",
+    "claude-code",
+    "cursor",
+    "cline"
+  ],
+  "homepage": "https://speak.matnoble.top",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MatNoble/matnoble-tts-skill.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MatNoble/matnoble-tts-skill/issues"
+  },
+  "author": "MatNoble (https://matnoble.top)",
+  "license": "MIT"
+}
