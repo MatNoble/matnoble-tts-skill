@@ -49,26 +49,7 @@ MatNoble-TTS 提供标准符合 OpenAI 音频规范的高性能边缘 HTTP API�
   - `X-RateLimit-Remaining`: 今日剩余可用次数
   - `X-RateLimit-Reset`: 今日重置的 UTC 时间戳（秒）
 
----
-
-### 2. 语音转文字 (STT)
-- **路径**：`POST /v1/audio/transcriptions`
-- **Content-Type**：`multipart/form-data`
-
-#### 请求参数 (Form Data)：
-- `file`: 音频文件（支持 mp3, wav, m4a, flac, aac 等，最大 10MB）
-- `token`: （可选）自定义硅基流动 API Token；留空则使用服务端内置 Token。
-
-#### 响应体 (JSON)：
-```json
-{
-  "text": "转录出的文字内容..."
-}
-```
-
----
-
-### 3. 用量与额度查询
+### 2. 用量与额度查询
 - **路径**：`GET /v1/api/usage`
 
 #### 响应示例 (JSON)：
