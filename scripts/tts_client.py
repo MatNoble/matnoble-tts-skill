@@ -13,11 +13,548 @@ import re
 import urllib.request
 import urllib.error
 import urllib.parse
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 DEFAULT_ENDPOINT = "https://speak.matnoble.top"
 DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
 MAX_PUBLIC_CHARS = 500
+
+# ----------------------------------------------------------------------
+# Text Preprocessing & Audio Director Pipeline (Zero Dependencies)
+# ----------------------------------------------------------------------
+
+class DirectiveMasker:
+    """Helper to protect existing directives/tags from being mutated by subsequent regex steps."""
+
+    PAIRED_TAG_RE = re.compile(r"\[([a-zA-Z0-9_-]+)(?::[^\]]*)?\].*?\[/\1\]", re.DOTALL)
+    SINGLE_TAG_RE = re.compile(r"\[[a-zA-Z0-9_-]+(?::[^\]]*)?\]")
+
+    @classmethod
+    def mask(cls, text: str, existing_placeholders: Optional[Dict[str, str]] = None) -> Tuple[str, Dict[str, str]]:
+        placeholders = existing_placeholders if existing_placeholders is not None else {}
+        idx = len(placeholders)
+
+        def repl(m):
+            nonlocal idx
+            ph = f"dirtag_{idx}"
+            idx += 1
+            placeholders[ph] = m.group(0)
+            return ph
+
+        text = cls.PAIRED_TAG_RE.sub(repl, text)
+        text = cls.SINGLE_TAG_RE.sub(repl, text)
+        return text, placeholders
+
+    @classmethod
+    def unmask(cls, text: str, placeholders: Dict[str, str]) -> str:
+        prev = None
+        while prev != text:
+            prev = text
+            for ph, original in placeholders.items():
+                text = text.replace(ph, original)
+        return text
+
+
+class TextNormalizer:
+    """Non-Standard Words (NSW) Normalizer for Chinese TTS (inspired by PaddleSpeech)."""
+
+    PHONE_RE = re.compile(r"(?<!\d)(1[3-9]\d{9}|(?:0\d{2,3}-?)?\d{7,8}|(?:400|800)[-\s]?\d{3,4}[-\s]?\d{3,4}|(?:400|800)\d{7})(?!\d)")
+    DIGITS_CONTEXT_RE = re.compile(r"((?:工号|编号|代号|验证码|密码|账号|座机|房间号|单号|订单号|卡号|QQ号?|号码)[是为：:\s]{0,3})(\d{2,12})(?!\d)")
+    LEADING_ZERO_RE = re.compile(r"(?<!\d)(0\d{1,8})(?!\d)")
+    STANDALONE_DIGITS_RE = re.compile(r"(?<![\d¥￥$€£])(\d{4,6})(?!\d)(?![0-9年月日号元块个只位次人张台条套件点分秒米克倍%％度本首篇幅间户层幢座架艘辆袋盒瓶桶折])")
+    
+    ACRONYM_RE = re.compile(r"(?<![a-zA-Z0-9])([A-Z]{2,6})(?![a-zA-Z0-9])")
+    CURRENCY_RE = re.compile(r"[¥￥](\d+(?:\.\d+)?)\s*")
+    PERCENT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[%％]")
+    DATE_RE = re.compile(r"(?<!\d)((?:19|20)\d{2}[-/.]\d{1,2}[-/.]\d{1,2})(?!\d)")
+
+    ACRONYMS = {
+        "API", "TTS", "AI", "SDK", "CPU", "GPU", "URL", "LLM", "HTTP", "HTTPS",
+        "REST", "JSON", "UI", "UX", "ID", "OS", "APP", "IP", "DNS", "VIP", "VVIP",
+        "K8S", "GPT", "AGI", "NLP", "CV", "ASR", "OCR", "RAG", "SLA", "CDN",
+        "SSML", "NSW", "CLI", "IDE", "GUI", "NPM", "CI", "CD", "TCP", "UDP",
+        "VPN", "SSH", "SSL", "TLS", "RAM", "ROM", "SSD", "HDD", "USB", "PDF",
+        "PPT", "DOC", "DOCX", "WIFI", "CEO", "CTO", "CFO", "COO", "HR", "PR",
+        "OK", "KOL", "KOC", "B2B", "B2C", "SaaS", "PaaS", "IaaS", "CRM", "ERP",
+        "OA", "SQL", "HTML", "CSS", "JS", "TS", "PHP"
+    }
+
+    NUM_MAP = {'0': '零', '1': '一', '2': '二', '3': '三', '4': '四',
+               '5': '五', '6': '六', '7': '七', '8': '八', '9': '九'}
+
+    @classmethod
+    def normalize(cls, text: str) -> Tuple[str, List[str]]:
+        logs = []
+
+        def replace_currency(m):
+            logs.append(f"NSW 货币: {m.group(0)} -> {m.group(1)}元")
+            return f"{m.group(1)}元"
+        text = cls.CURRENCY_RE.sub(replace_currency, text)
+
+        def replace_percent(m):
+            num_str = m.group(1)
+            parts = num_str.split('.')
+            int_part = cls._int_to_zh(int(parts[0]))
+            if len(parts) > 1:
+                dec_part = ''.join(cls.NUM_MAP.get(c, c) for c in parts[1])
+                zh_val = f"百分之{int_part}点{dec_part}"
+            else:
+                zh_val = f"百分之{int_part}"
+            logs.append(f"NSW 百分比: {m.group(0)} -> {zh_val}")
+            return zh_val
+        text = cls.PERCENT_RE.sub(replace_percent, text)
+
+        def replace_phone(m):
+            logs.append(f"NSW 电话: {m.group(1)} -> [say-as:telephone]{m.group(1)}[/say-as]")
+            return f"[say-as:telephone]{m.group(1)}[/say-as]"
+        text = cls.PHONE_RE.sub(replace_phone, text)
+
+        def replace_date(m):
+            logs.append(f"NSW 日期: {m.group(1)} -> [say-as:date]{m.group(1)}[/say-as]")
+            return f"[say-as:date]{m.group(1)}[/say-as]"
+        text = cls.DATE_RE.sub(replace_date, text)
+
+        masked, phs = DirectiveMasker.mask(text)
+
+        def replace_acronym(m):
+            word = m.group(1)
+            if word in cls.ACRONYMS or (len(word) >= 2 and word.isupper() and word not in {"THE", "AND", "FOR", "WITH", "THIS", "THAT", "FROM", "HAVE", "ARE", "YOU", "NOT"}):
+                logs.append(f"NSW 缩写: {word} -> [say-as:characters]{word}[/say-as]")
+                masked_tag, _ = DirectiveMasker.mask(f"[say-as:characters]{word}[/say-as]", phs)
+                return masked_tag
+            return word
+        masked = cls.ACRONYM_RE.sub(replace_acronym, masked)
+
+        def replace_context_digits(m):
+            prefix = m.group(1)
+            num = m.group(2)
+            logs.append(f"NSW 数字串: {num} -> [say-as:digits]{num}[/say-as]")
+            masked_tag, _ = DirectiveMasker.mask(f"[say-as:digits]{num}[/say-as]", phs)
+            return f"{prefix}{masked_tag}"
+        masked = cls.DIGITS_CONTEXT_RE.sub(replace_context_digits, masked)
+
+        def replace_leading_zero(m):
+            num = m.group(1)
+            logs.append(f"NSW 数字串: {num} -> [say-as:digits]{num}[/say-as]")
+            masked_tag, _ = DirectiveMasker.mask(f"[say-as:digits]{num}[/say-as]", phs)
+            return masked_tag
+        masked = cls.LEADING_ZERO_RE.sub(replace_leading_zero, masked)
+
+        def replace_standalone_digits(m):
+            num = m.group(1)
+            logs.append(f"NSW 数字串: {num} -> [say-as:digits]{num}[/say-as]")
+            masked_tag, _ = DirectiveMasker.mask(f"[say-as:digits]{num}[/say-as]", phs)
+            return masked_tag
+        masked = cls.STANDALONE_DIGITS_RE.sub(replace_standalone_digits, masked)
+
+        text = DirectiveMasker.unmask(masked, phs)
+        return text, logs
+
+    @classmethod
+    def _int_to_zh(cls, n: int) -> str:
+        if n == 0: return '零'
+        units = ['', '十', '百', '千', '万']
+        digits = '零一二三四五六七八九'
+        s = str(n)
+        l = len(s)
+        if l == 2 and s[0] == '1':
+            return '十' + (digits[int(s[1])] if s[1] != '0' else '')
+        res = []
+        for i, c in enumerate(s):
+            d = int(c)
+            pos = l - i - 1
+            if d != 0:
+                res.append(digits[d] + units[pos])
+            else:
+                if not res or res[-1] != '零':
+                    res.append('零')
+        zh = ''.join(res).rstrip('零')
+        return zh
+
+
+class PronunciationGuard:
+    """Polyphone Disambiguation and Pronunciation Guard (110+ high-frequency entries)."""
+
+    POLYPHONE_MAP = {
+        # 重 (chóng vs zhòng)
+        "重新": "[sub:chóng]重[/sub]新",
+        "重申": "[sub:chóng]重[/sub]申",
+        "重阳": "[sub:chóng]重[/sub]阳",
+        "重演": "[sub:chóng]重[/sub]演",
+        "重逢": "[sub:chóng]重[/sub]逢",
+        "重复": "[sub:chóng]重[/sub]复",
+        "重叠": "[sub:chóng]重[/sub]叠",
+        "重组": "[sub:chóng]重[/sub]组",
+        "重庆": "[sub:chóng]重[/sub]庆",
+        "重温": "[sub:chóng]重[/sub]温",
+        "重整旗鼓": "[sub:chóng]重[/sub]整旗鼓",
+        "重见天日": "[sub:chóng]重[/sub]见天日",
+        "重出江湖": "[sub:chóng]重[/sub]出江湖",
+        "重修旧好": "[sub:chóng]重[/sub]修旧好",
+        "重蹈覆辙": "[sub:chóng]重[/sub]蹈覆辙",
+        "重获新生": "[sub:chóng]重[/sub]获新生",
+        "重量": "[sub:zhòng]重[/sub]量",
+        "重心": "[sub:zhòng]重[/sub]心",
+        "沉重": "沉[sub:zhòng]重[/sub]",
+        "重视": "[sub:zhòng]重[/sub]视",
+        "重负": "[sub:zhòng]重[/sub]负",
+        "慎重": "慎[sub:zhòng]重[/sub]",
+        "举足轻重": "举足轻[sub:zhòng]重[/sub]",
+
+        # 行 (háng vs xíng)
+        "行业": "[sub:háng]行[/sub]业",
+        "银行": "银[sub:háng]行[/sub]",
+        "行规": "[sub:háng]行[/sub]规",
+        "同行": "同[sub:háng]行[/sub]",
+        "行情": "[sub:háng]行[/sub]情",
+        "行列": "[sub:háng]行[/sub]列",
+        "行家": "[sub:háng]行[/sub]家",
+        "内行": "内[sub:háng]行[/sub]",
+        "外行": "外[sub:háng]行[/sub]",
+        "这一行": "这一[sub:háng]行[/sub]",
+        "行走": "[sub:xíng]行[/sub]走",
+        "行动": "[sub:xíng]行[/sub]动",
+        "行程": "[sub:xíng]行[/sub]程",
+        "执行": "执[sub:xíng]行[/sub]",
+        "行为": "[sub:xíng]行[/sub]为",
+        "履行": "履[sub:xíng]行[/sub]",
+        "流行": "流[sub:xíng]行[/sub]",
+        "旅行": "旅[sub:xíng]行[/sub]",
+        "举行": "举[sub:xíng]行[/sub]",
+
+        # 差 (chāi vs chà vs chā vs cī)
+        "出差": "出[sub:chāi]差[/sub]",
+        "差事": "[sub:chāi]差[/sub]事",
+        "公差": "公[sub:chāi]差[/sub]",
+        "差使": "[sub:chāi]差[/sub]使",
+        "差距": "[sub:chā]差[/sub]距",
+        "差别": "[sub:chā]差[/sub]别",
+        "差异": "[sub:chā]差[/sub]异",
+        "偏差": "偏[sub:chā]差[/sub]",
+        "差错": "[sub:chā]差[/sub]错",
+        "差劲": "[sub:chà]差[/sub]劲",
+        "差不多": "[sub:chà]差[/sub]不多",
+        "差点": "[sub:chà]差[/sub]点",
+        "参差": "参[sub:cī]差[/sub]",
+        "参差不齐": "参[sub:cī]差[/sub]不齐",
+
+        # 藏 (zàng vs cáng)
+        "西藏": "西[sub:zàng]藏[/sub]",
+        "宝藏": "宝[sub:zàng]藏[/sub]",
+        "藏文": "[sub:zàng]藏[/sub]文",
+        "藏族": "[sub:zàng]藏[/sub]族",
+        "藏经阁": "[sub:zàng]藏[/sub]经阁",
+        "青藏": "青[sub:zàng]藏[/sub]",
+        "隐藏": "隐[sub:cáng]藏[/sub]",
+        "躲藏": "躲[sub:cáng]藏[/sub]",
+        "收藏": "收[sub:cáng]藏[/sub]",
+        "蕴藏": "蕴[sub:cáng]藏[/sub]",
+        "储藏": "储[sub:cáng]藏[/sub]",
+
+        # 说 (shuō vs shuì)
+        "说服": "[sub:shuō]说[/sub]服",
+        "游说": "游[sub:shuì]说[/sub]",
+
+        # 便 (pián vs biàn)
+        "便宜": "[sub:pián]便[/sub]宜",
+        "大腹便便": "大腹[sub:pián]便[/sub][sub:pián]便[/sub]",
+        "方便": "方[sub:biàn]便[/sub]",
+        "便利": "[sub:biàn]便[/sub]利",
+        "便民": "[sub:biàn]便[/sub]民",
+        "随便": "随[sub:biàn]便[/sub]",
+        "便捷": "[sub:biàn]便[/sub]捷",
+        "便当": "[sub:biàn]便[/sub]当",
+
+        # 处 (chǔ vs chù)
+        "处理": "[sub:chǔ]处[/sub]理",
+        "处于": "[sub:chǔ]处[/sub]于",
+        "处置": "[sub:chǔ]处[/sub]置",
+        "处境": "[sub:chǔ]处[/sub]境",
+        "处分": "[sub:chǔ]处[/sub]分",
+        "相处": "相[sub:chǔ]处[/sub]",
+        "惩处": "惩[sub:chǔ]处[/sub]",
+        "到处": "到[sub:chù]处[/sub]",
+        "处所": "[sub:chù]处[/sub]所",
+        "长处": "长[sub:chù]处[/sub]",
+        "好处": "好[sub:chù]处[/sub]",
+        "办事处": "办事[sub:chù]处[/sub]",
+
+        # 长 (cháng vs zhǎng)
+        "长度": "[sub:cháng]长[/sub]度",
+        "长短": "[sub:cháng]长[/sub]短",
+        "长江": "[sub:cháng]长[/sub]江",
+        "长远": "[sub:cháng]长[/sub]远",
+        "漫长": "漫[sub:cháng]长[/sub]",
+        "特长": "特[sub:cháng]长[/sub]",
+        "生长": "生[sub:zhǎng]长[/sub]",
+        "增长": "增[sub:zhǎng]长[/sub]",
+        "长辈": "[sub:zhǎng]长[/sub]辈",
+        "厂长": "厂[sub:zhǎng]长[/sub]",
+        "市长": "市[sub:zhǎng]长[/sub]",
+        "校长": "校[sub:zhǎng]长[/sub]",
+        "院长": "院[sub:zhǎng]长[/sub]",
+        "董事长": "董事[sub:zhǎng]长[/sub]",
+
+        # 调 (tiáo vs diào)
+        "调节": "[sub:tiáo]调[/sub]节",
+        "调整": "[sub:tiáo]调[/sub]整",
+        "协调": "协[sub:tiáo]调[/sub]",
+        "调和": "[sub:tiáo]调[/sub]和",
+        "调配": "[sub:tiáo]调[/sub]配",
+        "调查": "[sub:diào]调[/sub]查",
+        "调研": "[sub:diào]调[/sub]研",
+        "调动": "[sub:diào]调[/sub]动",
+        "调遣": "[sub:diào]调[/sub]遣",
+        "音调": "音[sub:diào]调[/sub]",
+        "声调": "声[sub:diào]调[/sub]",
+        "强调": "强[sub:diào]调[/sub]",
+        "情调": "情[sub:diào]调[/sub]",
+
+        # 乐 (yuè vs lè)
+        "音乐": "音[sub:yuè]乐[/sub]",
+        "乐器": "[sub:yuè]乐[/sub]器",
+        "乐队": "[sub:yuè]乐[/sub]队",
+        "乐曲": "[sub:yuè]乐[/sub]曲",
+        "奏乐": "奏[sub:yuè]乐[/sub]",
+        "快乐": "快[sub:lè]乐[/sub]",
+        "乐观": "[sub:lè]乐[/sub]观",
+        "乐趣": "[sub:lè]乐[/sub]趣",
+        "娱乐": "娱[sub:lè]乐[/sub]",
+
+        # 发 (fà vs fā)
+        "头发": "头[sub:fà]发[/sub]",
+        "理发": "理[sub:fà]发[/sub]",
+        "假发": "假[sub:fà]发[/sub]",
+        "短发": "短[sub:fà]发[/sub]",
+        "长发": "长[sub:fà]发[/sub]",
+        "白发": "白[sub:fà]发[/sub]",
+        "毛发": "毛[sub:fà]发[/sub]",
+        "发生": "[sub:fā]发[/sub]生",
+        "发现": "[sub:fā]发[/sub]现",
+        "发展": "[sub:fā]发[/sub]展",
+        "发挥": "[sub:fā]发[/sub]挥",
+        "发送": "[sub:fā]发[/sub]送",
+
+        # 传 (zhuàn vs chuán)
+        "传记": "[sub:zhuàn]传[/sub]记",
+        "自传": "自[sub:zhuàn]传[/sub]",
+        "评传": "评[sub:zhuàn]传[/sub]",
+        "外传": "外[sub:zhuàn]传[/sub]",
+        "水浒传": "水浒[sub:zhuàn]传[/sub]",
+        "传统": "[sub:chuán]传[/sub]统",
+        "传递": "[sub:chuán]传[/sub]递",
+        "传送": "[sub:chuán]传[/sub]送",
+        "宣传": "宣[sub:chuán]传[/sub]",
+        "流传": "流[sub:chuán]传[/sub]",
+
+        # 假 (jià vs jiǎ)
+        "假期": "[sub:jià]假[/sub]期",
+        "放假": "放[sub:jià]假[/sub]",
+        "请假": "请[sub:jià]假[/sub]",
+        "休假": "休[sub:jià]假[/sub]",
+        "节假日": "节[sub:jià]假[/sub]日",
+        "假装": "[sub:jiǎ]假[/sub]装",
+        "假设": "[sub:jiǎ]假[/sub]设",
+        "假话": "[sub:jiǎ]假[/sub]话",
+        "虚假": "虚[sub:jiǎ]假[/sub]",
+        "真假": "真[sub:jiǎ]假[/sub]",
+
+        # 降 (jiàng vs xiáng)
+        "降落": "[sub:jiàng]降[/sub]落",
+        "下降": "下[sub:jiàng]降[/sub]",
+        "降低": "[sub:jiàng]降[/sub]低",
+        "降价": "[sub:jiàng]降[/sub]价",
+        "投降": "投[sub:xiáng]降[/sub]",
+        "降服": "[sub:xiáng]降[/sub]服",
+        "劝降": "劝[sub:xiáng]降[/sub]",
+
+        # 弹 (tán vs dàn)
+        "弹琴": "[sub:tán]弹[/sub]琴",
+        "弹奏": "[sub:tán]弹[/sub]奏",
+        "弹力": "[sub:tán]弹[/sub]力",
+        "弹性": "[sub:tán]弹[/sub]性",
+        "反弹": "反[sub:tán]弹[/sub]",
+        "子弹": "子[sub:dàn]弹[/sub]",
+        "导弹": "导[sub:dàn]弹[/sub]",
+        "炮弹": "炮[sub:dàn]弹[/sub]",
+        "炸弹": "炸[sub:dàn]弹[/sub]",
+        "弹头": "[sub:dàn]弹[/sub]头",
+
+        # 朝 (cháo vs zhāo)
+        "朝代": "[sub:cháo]朝[/sub]代",
+        "朝向": "[sub:cháo]朝[/sub]向",
+        "朝廷": "[sub:cháo]朝[/sub]廷",
+        "唐朝": "唐[sub:cháo]朝[/sub]",
+        "清朝": "清[sub:cháo]朝[/sub]",
+        "明朝": "明[sub:cháo]朝[/sub]",
+        "朝夕": "[sub:zhāo]朝[/sub]夕",
+        "朝阳": "[sub:zhāo]朝[/sub]阳",
+        "朝气": "[sub:zhāo]朝[/sub]气",
+        "朝思暮想": "[sub:zhāo]朝[/sub]思暮想",
+
+        # 载 (zài vs zǎi)
+        "载重": "[sub:zài]载[/sub]重",
+        "装载": "装[sub:zài]载[/sub]",
+        "载体": "[sub:zài]载[/sub]体",
+        "承载": "承[sub:zài]载[/sub]",
+        "满载": "满[sub:zài]载[/sub]",
+        "载客": "[sub:zài]载[/sub]客",
+        "运载": "运[sub:zài]载[/sub]",
+        "记载": "记[sub:zǎi]载[/sub]",
+        "登载": "登[sub:zǎi]载[/sub]",
+        "刊载": "刊[sub:zǎi]载[/sub]",
+        "千载难逢": "千[sub:zǎi]载[/sub]难逢",
+        "三年五载": "三年五[sub:zǎi]载[/sub]",
+
+        # 累 (lèi vs léi vs lěi)
+        "劳累": "劳[sub:lèi]累[/sub]",
+        "疲累": "疲[sub:lèi]累[/sub]",
+        "果实累累": "果实[sub:léi]累[/sub][sub:léi]累[/sub]",
+        "累赘": "[sub:léi]累[/sub]赘",
+        "积累": "积[sub:lěi]累[/sub]",
+        "累计": "[sub:lěi]累[/sub]计",
+
+        # 强 (qiáng vs qiǎng vs jiàng)
+        "勉强": "勉[sub:qiǎng]强[/sub]",
+        "强迫": "[sub:qiǎng]强[/sub]迫",
+        "强求": "[sub:qiǎng]强[/sub]求",
+        "强词夺理": "[sub:qiǎng]强[/sub]词夺理",
+        "强大": "[sub:qiáng]强[/sub]大",
+        "强壮": "[sub:qiáng]强[/sub]壮",
+        "坚强": "坚[sub:qiáng]强[/sub]",
+        "倔强": "倔[sub:jiàng]强[/sub]",
+
+        # 盛 (shèng vs chéng)
+        "盛开": "[sub:shèng]盛[/sub]开",
+        "盛大": "[sub:shèng]盛[/sub]大",
+        "盛宴": "[sub:shèng]盛[/sub]宴",
+        "盛夏": "[sub:shèng]盛[/sub]夏",
+        "盛饭": "[sub:chéng]盛[/sub]饭",
+        "盛水": "[sub:chéng]盛[/sub]水",
+        "盛满": "[sub:chéng]盛[/sub]满",
+
+        # 背 (bēi vs bèi)
+        "背包": "[sub:bēi]背[/sub]包",
+        "背负": "[sub:bēi]背[/sub]负",
+        "背水一战": "[sub:bēi]背[/sub]水一战",
+        "背景": "[sub:bèi]背[/sub]景",
+        "背后": "[sub:bèi]背[/sub]后",
+        "后背": "后[sub:bèi]背[/sub]",
+        "背诵": "[sub:bèi]背[/sub]诵",
+        "违背": "违[sub:bèi]背[/sub]",
+
+        # 埋 (mái vs mán)
+        "埋怨": "[sub:mán]埋[/sub]怨",
+        "埋头": "[sub:mái]埋[/sub]头",
+        "埋伏": "[sub:mái]埋[/sub]伏",
+        "掩埋": "掩[sub:mái]埋[/sub]",
+
+        # 秘 (bì vs mì)
+        "秘鲁": "[sub:bì]秘[/sub]鲁",
+        "秘密": "[sub:mì]秘[/sub]密",
+        "秘书": "[sub:mì]秘[/sub]书",
+        "秘诀": "[sub:mì]秘[/sub]诀",
+        "神秘": "神[sub:mì]秘[/sub]",
+
+        # 会 (kuài vs huì)
+        "会计": "[sub:kuài]会[/sub]计",
+        "财会": "财[sub:kuài]会[/sub]",
+
+        # 特殊专有名词 / 地名 / 药材 / 古音
+        "阿胶": "[sub:ē]阿[/sub]胶",
+        "阿谀": "[sub:ē]阿[/sub]谀",
+        "阿谀奉承": "[sub:ē]阿[/sub]谀奉承",
+        "六安": "[sub:lù]六[/sub]安",
+        "华山": "[sub:huà]华[/sub]山",
+        "龟兹": "[sub:qiū]龟[/sub][sub:cí]兹[/sub]",
+        "龟裂": "[sub:jūn]龟[/sub]裂",
+        "单于": "[sub:chán]单[/sub]于",
+        "大月氏": "大[sub:ròu]月[/sub][sub:zhī]氏[/sub]",
+        "蚌埠": "[sub:bèng]蚌[/sub]埠",
+        "朴刀": "[sub:pō]朴[/sub]刀",
+        "句读": "句[sub:dòu]读[/sub]",
+        "拾级而上": "[sub:shè]拾[/sub]级而上",
+        "商贾": "商[sub:gǔ]贾[/sub]",
+        "自怨自艾": "自怨自[sub:yì]艾[/sub]",
+        "提防": "[sub:dī]提[/sub]防",
+        "殷红": "[sub:yān]殷[/sub]红",
+        "熨帖": "[sub:yù]熨[/sub]帖",
+    }
+
+    @classmethod
+    def apply(cls, text: str) -> Tuple[str, List[str]]:
+        logs = []
+        masked, phs = DirectiveMasker.mask(text)
+
+        sorted_words = sorted(cls.POLYPHONE_MAP.keys(), key=len, reverse=True)
+        for word in sorted_words:
+            sub_repl = cls.POLYPHONE_MAP[word]
+            if word in masked:
+                logs.append(f"多音字防护: '{word}' -> '{sub_repl}'")
+                masked_sub, _ = DirectiveMasker.mask(sub_repl, phs)
+                masked = masked.replace(word, masked_sub)
+
+        text = DirectiveMasker.unmask(masked, phs)
+        return text, logs
+
+
+class ProsodyEngine:
+    """Four-level Prosody & Breathing Injection Engine."""
+
+    TRANSITION_WORDS = [
+        "更重要的是", "值得注意的是", "换句话说", "总而言之", "综上所述",
+        "但是", "然而", "不过", "可是", "因此", "所以", "反之"
+    ]
+
+    @classmethod
+    def inject(cls, text: str, scene: Optional[str] = None) -> Tuple[str, List[str]]:
+        logs = []
+        masked, phs = DirectiveMasker.mask(text)
+
+        def replace_question(m):
+            punct = m.group(1)
+            pause_tag = "[pause:600ms]"
+            masked_pause, _ = DirectiveMasker.mask(pause_tag, phs)
+            logs.append(f"韵律注入: 设问悬念停顿 600ms ({punct})")
+            return f"{punct}{masked_pause}"
+        masked = re.sub(r"([？?])(?!\s*dirtag_)", replace_question, masked)
+
+        sorted_transitions = sorted(cls.TRANSITION_WORDS, key=len, reverse=True)
+        for tw in sorted_transitions:
+            pattern = re.compile(r"(dirtag_\d+)?(" + re.escape(tw) + r")")
+            def replace_transition(m):
+                prev_ph = m.group(1)
+                word = m.group(2)
+                if prev_ph and prev_ph in phs and "pause" in phs[prev_ph].lower():
+                    return m.group(0)
+                pause_tag = "[pause:400ms]"
+                masked_pause, _ = DirectiveMasker.mask(pause_tag, phs)
+                logs.append(f"韵律注入: 转折词 '{word}' 前置呼吸 400ms")
+                prefix = prev_ph if prev_ph else ""
+                return f"{prefix}{masked_pause}{word}"
+
+            masked = pattern.sub(replace_transition, masked)
+
+        text = DirectiveMasker.unmask(masked, phs)
+        return text, logs
+
+
+def preprocess_text(text: str, auto_prosody: bool = False, scene: Optional[str] = None) -> Tuple[str, List[str]]:
+    """Complete text preprocessing pipeline combining ProsodyEngine, Normalizer and PolyphoneGuard."""
+    all_logs = []
+    
+    if auto_prosody:
+        text, prosody_logs = ProsodyEngine.inject(text, scene)
+        all_logs.extend(prosody_logs)
+
+    text, nsw_logs = TextNormalizer.normalize(text)
+    all_logs.extend(nsw_logs)
+
+    text, poly_logs = PronunciationGuard.apply(text)
+    all_logs.extend(poly_logs)
+
+    return text, all_logs
+
 
 # ----------------------------------------------------------------------
 # Directive to SSML Converter & Validator
@@ -61,8 +598,8 @@ def validate_directives(text: str) -> Tuple[bool, list]:
         arg = (match.group(2) or "").strip()
 
         directive_count += 1
-        if directive_count > 50:
-            issues.append("警告：行内指令数量超过推荐上限 50 个。")
+        if directive_count > 100:
+            issues.append("警告：行内指令数量较多（> 100 个）。")
 
         if is_close:
             if not stack:
@@ -171,7 +708,6 @@ def convert_directives_to_ssml(text: str, voice: str = DEFAULT_VOICE, speed: flo
                 body += escape_xml(m.group(0))
                 i = m.end()
 
-    # Wrap in voice & prosody
     rate_pct = f"{int((speed - 1.0) * 100):+d}%" if speed != 1.0 else None
     pitch_val = f"{int(pitch):+d}Hz" if pitch not in ("0", "") else None
 
@@ -322,16 +858,19 @@ def main():
   # 1. 基础合成 (直接试用公共通道)
   python3 tts_client.py --text "你好，世界！" --output hello.mp3
 
-  # 2. 带语音指令的自然修饰合成
-  python3 tts_client.py --text "大家好[pause:500ms][emphasis:strong]欢迎体验[/emphasis]智能配音服务。" --output demo.mp3
+  # 2. 文本自动预处理与发音防护 (NSW 规范化 + 多音字防翻车)
+  python3 tts_client.py --preprocess --text "拨打 13800138000 重新核算重量。"
 
-  # 3. 本地预览并验证转换为标准 SSML
+  # 3. 自动配音导演模式 (预处理 + 注入四级韵律停顿)
+  python3 tts_client.py --preprocess --auto-prosody --text "这项技术很强，但是成本很高。你觉得呢？"
+
+  # 4. 本地预览并验证转换为标准 SSML
   python3 tts_client.py --to-ssml --text "转折前稍作停顿[pause:600ms]然后继续讲述。"
 
-  # 4. 检查指令语法
+  # 5. 检查指令语法
   python3 tts_client.py --validate --text "未闭合标签[emphasis:strong]测试文本"
 
-  # 5. 查询剩余额度
+  # 6. 查询剩余额度
   python3 tts_client.py --check-usage
 """
     )
@@ -347,14 +886,16 @@ def main():
     parser.add_argument("--pitch", default="0", help="音调偏移 Hz，如 +10, -10 (默认: 0)")
     parser.add_argument("--volume", default="0", help="音量偏移 (默认: 0)")
     parser.add_argument("--style", default="general", help="情感风格 (如 cheerful, serious, calm 等)")
-    parser.add_argument("--output", "-o", default="output.mp3", help="输出音频文件路径 (默认: output.mp3)")
+    parser.add_argument("--output", "-o", default=None, help="输出音频文件路径 (默认: output.mp3)")
     parser.add_argument("--check-usage", action="store_true", help="查询当前 Key 或公共通道的配额用量")
     parser.add_argument("--to-ssml", action="store_true", help="仅将文本与行内指令转为标准 SSML 打印输出，不发请求")
     parser.add_argument("--validate", action="store_true", help="验证文本内语音指令的闭合性与参数合法性")
+    parser.add_argument("--preprocess", action="store_true", help="启用文本预处理流水线 (NSW规范化 + 多音字防护)")
+    parser.add_argument("--auto-prosody", action="store_true", help="配合 --preprocess 自动注入转折与设问韵律停顿")
 
     args = parser.parse_args()
 
-    # 1. 检查配额
+    # 1. 检查用量
     if args.check_usage:
         check_usage(args.endpoint, args.api_key)
         return
@@ -370,6 +911,18 @@ def main():
     if args.ssml_file:
         with open(args.ssml_file, "r", encoding="utf-8") as f:
             raw_ssml = f.read()
+
+    # 预处理流水线
+    if raw_text and args.preprocess:
+        preprocessed_text, logs = preprocess_text(raw_text, auto_prosody=args.auto_prosody)
+        if not args.output and not args.to_ssml and not args.validate:
+            print("=== 文本预处理流水线执行日志 ===")
+            for log in logs:
+                print(f"  • {log}")
+            print("\n=== 加工后文本 ===")
+            print(preprocessed_text)
+            return
+        raw_text = preprocessed_text
 
     # 2. 校验指令
     if args.validate:
@@ -400,6 +953,7 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    output_file = args.output if args.output else "output.mp3"
     synthesize_speech(
         endpoint=args.endpoint,
         api_key=args.api_key,
@@ -410,7 +964,7 @@ def main():
         pitch=args.pitch,
         volume=args.volume,
         style=args.style,
-        output_file=args.output
+        output_file=output_file
     )
 
 if __name__ == "__main__":
